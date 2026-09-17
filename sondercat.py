@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SondeR cat v2 — pixel cats that live on your desktop. Windows + Linux.
+SondeR cat v2 — pixel cats that live on your desktop. Windows + Linux + macOS.
 
 What's new in v2:
   * buttery-smooth animation (25 fps, time-based frames, sub-pixel movement)
@@ -31,6 +31,7 @@ import traceback
 from collections import deque
 
 ERROR_LOG = os.path.join(os.path.expanduser("~"), "sondercat_error.log")
+IS_MAC = (platform.system() == "Darwin")
 
 
 def _fatal(title, details):
@@ -49,6 +50,17 @@ def _fatal(title, details):
                 0, f"{title}\n\n{details[-900:]}\n\n"
                    f"Full details saved to:\n{ERROR_LOG}",
                 "SondeR cat couldn't start", 0x10)
+            shown = True
+        except Exception:
+            pass
+    if not shown and IS_MAC:
+        try:
+            body = (f"{title}\n\n{details[-600:]}\n\nFull details saved "
+                    f"to:\n{ERROR_LOG}").replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.run(["osascript", "-e",
+                            f'display dialog "{body}" with title '
+                            f'"SondeR cat couldn\'t start" buttons {{"OK"}} '
+                            'with icon stop'], timeout=120)
             shown = True
         except Exception:
             pass
@@ -117,21 +129,523 @@ def _linux_preflight_warn():
         pass
 
 
+# ------------------------------------------------------------ macOS glue -----
+
+class MacOS:
+    """Native macOS backend: pyobjc for AppKit/Quartz plus a few ctypes calls
+    into system frameworks that pyobjc doesn't wrap. Every method is
+    best-effort and returns a neutral value on failure, so a feature quietly
+    switches off instead of taking the cat down — same contract as the
+    Windows/Linux paths.
+
+    Coordinates: CoreGraphics window bounds and Qt's screen geometry BOTH use
+    logical points with the origin at the top-left of the main display, so
+    nothing here needs scaling or y-flipping."""
+
+    _libs = {}
+    _wcache = {}                 # onscreen? -> (timestamp, rows)
+    WCACHE_S = 0.06              # the perch tick polls at 30 fps: share calls
+
+    @classmethod
+    def _lib(cls, name):
+        lib = cls._libs.get(name)
+        if lib is None:
+            import ctypes
+            lib = ctypes.CDLL(
+                f"/System/Library/Frameworks/{name}.framework/{name}")
+            cls._libs[name] = lib
+        return lib
+
+    # ---- privacy permissions ------------------------------------------
+    @staticmethod
+    def ax_trusted(prompt=False):
+        """Accessibility — global mouse/scroll hooks (pynput). prompt=True
+        lets macOS show its own 'wants to control this computer' dialog."""
+        try:
+            import ApplicationServices as AS
+            if prompt:
+                from Foundation import NSDictionary
+                key = getattr(AS, "kAXTrustedCheckOptionPrompt",
+                              "AXTrustedCheckOptionPrompt")
+                opts = NSDictionary.dictionaryWithObject_forKey_(True, key)
+                return bool(AS.AXIsProcessTrustedWithOptions(opts))
+            return bool(AS.AXIsProcessTrusted())
+        except Exception:
+            return True                  # can't tell: don't nag
+
+    @classmethod
+    def input_monitoring(cls, prompt=False):
+        """Input Monitoring — the global keyboard listener. IOHIDCheckAccess
+        returns 0 granted / 1 denied / 2 never asked."""
+        try:
+            import ctypes
+            io = cls._lib("IOKit")
+            io.IOHIDCheckAccess.argtypes = [ctypes.c_uint32]
+            io.IOHIDCheckAccess.restype = ctypes.c_uint32
+            if io.IOHIDCheckAccess(1) == 0:          # kIOHIDRequestTypeListenEvent
+                return True
+            if prompt:
+                io.IOHIDRequestAccess.argtypes = [ctypes.c_uint32]
+                io.IOHIDRequestAccess.restype = ctypes.c_bool
+                return bool(io.IOHIDRequestAccess(1))
+            return False
+        except Exception:
+            return True
+
+    @classmethod
+    def screen_capture(cls, prompt=False):
+        """Screen Recording — needed for the Gemini screen-look/guide
+        screenshots; without it grabWindow() returns only the wallpaper."""
+        try:
+            import ctypes
+            cg = cls._lib("CoreGraphics")
+            cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+            if cg.CGPreflightScreenCaptureAccess():
+                return True
+            if prompt:
+                cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+                return bool(cg.CGRequestScreenCaptureAccess())
+            return False
+        except Exception:
+            return True
+
+    PANES = {"accessibility": "Privacy_Accessibility",
+             "input": "Privacy_ListenEvent",
+             "screen": "Privacy_ScreenCapture"}
+
+    @classmethod
+    def open_privacy_pane(cls, which):
+        try:
+            subprocess.Popen(["open", "x-apple.systempreferences:com.apple."
+                              "preference.security?" + cls.PANES[which]])
+        except Exception:
+            pass
+
+    # ---- other apps' windows --------------------------------------------
+    @classmethod
+    def windows(cls, onscreen=True):
+        """Top-level windows, front-to-back, as dicts:
+        {id, pid, owner, layer, alpha, rect=(l, t, r, b)}. Cached for a few
+        ms because several probes per tick would otherwise each ask the
+        window server again."""
+        now = time.time()
+        hit = cls._wcache.get(onscreen)
+        if hit and now - hit[0] < cls.WCACHE_S:
+            return hit[1]
+        import Quartz as Q
+        opt = Q.kCGWindowListExcludeDesktopElements | (
+            Q.kCGWindowListOptionOnScreenOnly if onscreen
+            else Q.kCGWindowListOptionAll)
+        out = []
+        for w in Q.CGWindowListCopyWindowInfo(opt, Q.kCGNullWindowID) or []:
+            b = w.get("kCGWindowBounds") or {}
+            l, t = int(b.get("X", 0)), int(b.get("Y", 0))
+            out.append({"id": int(w.get("kCGWindowNumber", 0)),
+                        "pid": int(w.get("kCGWindowOwnerPID", 0)),
+                        "owner": str(w.get("kCGWindowOwnerName", "")),
+                        "layer": int(w.get("kCGWindowLayer", 0)),
+                        "alpha": float(w.get("kCGWindowAlpha", 1.0)),
+                        "rect": (l, t, l + int(b.get("Width", 0)),
+                                 t + int(b.get("Height", 0)))})
+        cls._wcache[onscreen] = (now, out)
+        return out
+
+    @classmethod
+    def app_windows(cls):
+        """Ordinary document windows of OTHER apps: layer 0 (menus, the
+        Dock, the menu bar and floating panels live on higher layers), not
+        see-through, on THIS desktop and really on a screen. The last two
+        matter during a Space switch: while the slide runs, the window
+        server reports every desktop's windows as "on screen" at far
+        off-screen coordinates (x = -4000...), and the cat once spotted a
+        window two desktops away and ran off the edge after it."""
+        me = os.getpid()
+        out = [w for w in cls.windows(True)
+               if w["layer"] == 0 and w["alpha"] > 0.05 and w["pid"] != me]
+        screens = [s.geometry() for s in QGuiApplication.screens()]
+
+        def on_a_screen(rect):
+            l, t, r, b = rect
+            return any(r > g.left() and l <= g.right()
+                       and b > g.top() and t <= g.bottom() for g in screens)
+
+        out = [w for w in out if on_a_screen(w["rect"])]
+        cur = cls.active_space()
+        if cur:
+            keep = []
+            for w in out:
+                sp = cls.window_spaces(w["id"])
+                if not sp or cur in sp:      # unknown => assume all-Spaces
+                    keep.append(w)
+            out = keep
+        return out
+
+    @classmethod
+    def active_space(cls):
+        """Id of the desktop currently shown (changes only once a switch
+        animation has finished), or 0 if the private API is unavailable."""
+        try:
+            sky = cls._skylight()
+            return int(sky.CGSGetActiveSpace(cls._cid))
+        except Exception:
+            return 0
+
+    @classmethod
+    def window_spaces(cls, wid):
+        """Ids of the Spaces a window lives on ([] if unknown)."""
+        try:
+            import objc
+            sky = cls._skylight()
+            arr = objc.objc_object(c_void_p=sky.CGSCopySpacesForWindows(
+                cls._cid, 7, cls._cf_ints(wid)))
+            return [int(x) for x in arr] if arr is not None else []
+        except Exception:
+            return []
+
+    @classmethod
+    def window_at(cls, x, y):
+        """Topmost on-screen window covering logical point (x, y), or None
+        (our own cat windows included — callers check the pid). Only the
+        document/floating/panel layers count: the Dock owns an invisible
+        screen-sized window on layer 20 that would otherwise 'cover'
+        everything, and the menu bar and popups live even higher."""
+        for w in cls.windows(True):
+            if w["alpha"] <= 0.05 or not (0 <= w["layer"] <= 8):
+                continue
+            l, t, r, b = w["rect"]
+            if l <= x < r and t <= y < b:
+                return w
+        return None
+
+    @staticmethod
+    def frontmost():
+        """(pid, bundle id) of the active app."""
+        try:
+            from AppKit import NSWorkspace
+            a = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return int(a.processIdentifier()), str(a.bundleIdentifier() or "")
+        except Exception:
+            return 0, ""
+
+    # ---- system audio -----------------------------------------------------
+    @classmethod
+    def _audio_u32(cls, obj, selector):
+        import ctypes, struct
+        ca = cls._lib("CoreAudio")
+
+        class Addr(ctypes.Structure):
+            _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32),
+                        ("elem", ctypes.c_uint32)]
+
+        fourcc = lambda s: struct.unpack(">I", s.encode())[0]
+        addr = Addr(fourcc(selector), fourcc("glob"), 0)
+        val = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(4)
+        ca.AudioObjectGetPropertyData.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(Addr), ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+        ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
+        if ca.AudioObjectGetPropertyData(obj, ctypes.byref(addr), 0, None,
+                                         ctypes.byref(size),
+                                         ctypes.byref(val)) != 0:
+            raise OSError(f"CoreAudio property {selector} failed")
+        return val.value
+
+    @classmethod
+    def audio_state(cls):
+        """(anyone_playing, we_are_playing) on the default output device.
+        macOS has no public 'output peak level' the way WASAPI does, so the
+        cat listens for the device being driven at all: any app streaming
+        sound counts as music."""
+        dev = cls._audio_u32(1, "dOut")     # kAudioHardwarePropertyDefaultOutputDevice
+        somewhere = bool(cls._audio_u32(dev, "gone"))   # ...DeviceIsRunningSomewhere
+        here = bool(cls._audio_u32(dev, "goin"))        # ...DeviceIsRunning (us)
+        return somewhere, here
+
+    # ---- our own app & windows -------------------------------------------
+    @staticmethod
+    def activate():
+        """Bring the app forward even from the background (the ask box must
+        take the keyboard on Ctrl+Space without a click)."""
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def become_accessory():
+        """No Dock icon, no app menu: the cat is a desktop pet, not an app.
+        Dialogs and the tray menu keep working — it's how menubar-only apps
+        run."""
+        try:
+            from AppKit import (NSApplication,
+                                NSApplicationActivationPolicyAccessory)
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _nswindow(widget):
+        """The NSWindow behind one of our widgets, or None. Reads the id
+        Qt already has (internalWinId) and never asks it to CREATE one:
+        we get called from the WinIdChange event that Qt sends while it is
+        tearing a popup's native window down (hidden submenus lose theirs),
+        and a winId() call at that moment builds a fresh NSView mid-destroy
+        and leaves a dangling pointer behind -- the next time that submenu
+        opened, the cat died with a bus error."""
+        try:
+            import objc
+            wid = int(widget.internalWinId())
+            if not wid:
+                return None
+            view = objc.objc_object(c_void_p=wid)
+            return view.window() if view is not None else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def tune_window(widget):
+        """Make one of our top-level windows behave like a desktop pet:
+        follow the user across Spaces, stay up over fullscreen apps (so the
+        fullscreen peek can happen at all), and NEVER hide when another app
+        is active — Qt.Tool panels do exactly that by default on macOS,
+        which left the cat invisible the moment you clicked anywhere else."""
+        try:
+            widget.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
+        except Exception:
+            pass
+        try:
+            from AppKit import (NSWindowCollectionBehaviorCanJoinAllSpaces,
+                                NSWindowCollectionBehaviorMoveToActiveSpace,
+                                NSWindowCollectionBehaviorStationary,
+                                NSWindowCollectionBehaviorFullScreenAuxiliary,
+                                NSWindowCollectionBehaviorIgnoresCycle)
+            win = MacOS._nswindow(widget)
+            if win is None:
+                return False
+            # Qt gives Tool panels MoveToActiveSpace, which AppKit refuses to
+            # combine with CanJoinAllSpaces — swap one for the other
+            beh = win.collectionBehavior() \
+                & ~NSWindowCollectionBehaviorMoveToActiveSpace
+            win.setCollectionBehavior_(
+                beh
+                | NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorFullScreenAuxiliary
+                | NSWindowCollectionBehaviorIgnoresCycle)
+            win.setHidesOnDeactivate_(False)
+            # Qt doesn't map WA_TransparentForMouseEvents to the NSWindow on
+            # macOS, so the "click-through" full-screen overlays (guard beam,
+            # guide glow) were swallowing every click meant for the cat —
+            # right-click included. Make them genuinely click-through.
+            if widget.testAttribute(Qt.WA_TransparentForMouseEvents):
+                win.setIgnoresMouseEvents_(True)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def sink_below_cat(widget):
+        """Drop a full-screen game panel one NSWindow level so the cat stays
+        in front of it. Qt puts every Tool+StaysOnTop window on the same
+        level, and on macOS the panel — which takes focus — always wins the
+        z-order fight against the cat's raise_(), leaving only a faint
+        silhouette of the cat behind the 94%-opaque panel."""
+        try:
+            from AppKit import NSFloatingWindowLevel
+            win = MacOS._nswindow(widget)
+            if win is None:
+                return False
+            win.setLevel_(NSFloatingWindowLevel)
+            return True
+        except Exception:
+            return False
+
+    # ---- pinned to the glass: a private Space that never slides -----------
+    # macOS animates EVERY window of the outgoing desktop during a Space
+    # switch — CanJoinAllSpaces windows included — so the cat slid off the
+    # edge with the old desktop and popped back in on the new one, whatever
+    # its window level. What stays put (menu bar extras, overlay tools like
+    # yabai) lives in a private Space of its own at a high absolute level;
+    # windows there are drawn on top of every desktop and are simply not
+    # part of the transition. Private CoreGraphics-Services calls, guarded
+    # everywhere: if anything is missing the cat just keeps sliding.
+    _sky = None
+    _cid = None
+    _pin_sid = None
+    _pinned = set()                     # window numbers in the private Space
+    _keep = []                          # NSArrays handed to C, kept alive
+    PIN_LEVEL = 400
+    _pin_hidden = False                 # whole private Space tucked away (lock screen)
+
+    @staticmethod
+    def _skylight():
+        if MacOS._sky is None:
+            import ctypes
+            sky = ctypes.CDLL("/System/Library/PrivateFrameworks/"
+                              "SkyLight.framework/SkyLight")
+            sky.CGSMainConnectionID.restype = ctypes.c_uint32
+            sky.CGSSpaceCreate.restype = ctypes.c_uint64
+            sky.CGSSpaceCreate.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                           ctypes.c_void_p]
+            sky.CGSSpaceSetAbsoluteLevel.argtypes = [ctypes.c_uint32,
+                                                     ctypes.c_uint64,
+                                                     ctypes.c_int]
+            sky.CGSShowSpaces.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+            sky.CGSHideSpaces.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+            sky.CGSAddWindowsToSpaces.argtypes = [ctypes.c_uint32,
+                                                  ctypes.c_void_p,
+                                                  ctypes.c_void_p]
+            sky.CGSRemoveWindowsFromSpaces.argtypes = [ctypes.c_uint32,
+                                                       ctypes.c_void_p,
+                                                       ctypes.c_void_p]
+            sky.CGSSpaceDestroy.argtypes = [ctypes.c_uint32, ctypes.c_uint64]
+            sky.CGSGetActiveSpace.restype = ctypes.c_uint64
+            sky.CGSGetActiveSpace.argtypes = [ctypes.c_uint32]
+            sky.CGSCopySpacesForWindows.restype = ctypes.c_void_p
+            sky.CGSCopySpacesForWindows.argtypes = [ctypes.c_uint32,
+                                                    ctypes.c_int,
+                                                    ctypes.c_void_p]
+            MacOS._cid = sky.CGSMainConnectionID()
+            MacOS._sky = sky
+        return MacOS._sky
+
+    @staticmethod
+    def _cf_ints(*values):
+        from Foundation import NSArray
+        a = NSArray.arrayWithArray_([int(v) for v in values])
+        MacOS._keep.append(a)
+        if len(MacOS._keep) > 64:
+            del MacOS._keep[:32]
+        return a.__c_void_p__().value
+
+    @staticmethod
+    def _pin_space():
+        if MacOS._pin_sid is None:
+            sky = MacOS._skylight()
+            sid = sky.CGSSpaceCreate(MacOS._cid, 1, None)
+            if not sid:
+                raise OSError("CGSSpaceCreate failed")
+            sky.CGSSpaceSetAbsoluteLevel(MacOS._cid, sid, MacOS.PIN_LEVEL)
+            if MacOS._pin_hidden:
+                sky.CGSHideSpaces(MacOS._cid, MacOS._cf_ints(sid))
+            else:
+                sky.CGSShowSpaces(MacOS._cid, MacOS._cf_ints(sid))
+            MacOS._pin_sid = sid
+            import atexit
+            atexit.register(MacOS._destroy_pin_space)
+        return MacOS._pin_sid
+
+    @staticmethod
+    def _destroy_pin_space():
+        try:
+            if MacOS._pin_sid:
+                MacOS._sky.CGSSpaceDestroy(MacOS._cid, MacOS._pin_sid)
+        except Exception:
+            pass
+        MacOS._pin_sid = None
+        MacOS._pinned.clear()
+
+    @staticmethod
+    def screen_locked():
+        """True while the lock screen (or a password-protected screen saver)
+        is up. The session dictionary only carries the key while locked."""
+        try:
+            from Quartz import CGSessionCopyCurrentDictionary
+            d = CGSessionCopyCurrentDictionary()
+            return bool(d and d.get("CGSSessionScreenIsLocked", 0))
+        except Exception:
+            return False
+
+    @staticmethod
+    def set_pin_hidden(hidden):
+        """Tuck the whole private Space away (lock screen) or bring it back.
+        The Space sits above everything -- the lock screen included -- so
+        without this the cat kept pacing around on top of the password box.
+        One SkyLight call for all our windows; no Qt state is touched."""
+        hidden = bool(hidden)
+        if hidden == MacOS._pin_hidden:
+            return
+        MacOS._pin_hidden = hidden
+        try:
+            if MacOS._pin_sid:
+                sky = MacOS._skylight()
+                fn = sky.CGSHideSpaces if hidden else sky.CGSShowSpaces
+                fn(MacOS._cid, MacOS._cf_ints(MacOS._pin_sid))
+        except Exception:
+            pass
+
+    @staticmethod
+    def poll_lock():
+        MacOS.set_pin_hidden(MacOS.screen_locked())
+
+    @staticmethod
+    def pin_wanted():
+        # the private Space belongs to the main display; with a second
+        # monitor attached the cat goes back to ordinary Space behaviour
+        # rather than risk vanishing when dragged onto the other screen
+        return len(QGuiApplication.screens()) == 1
+
+    @staticmethod
+    def pin_window(widget, on=None):
+        """Put one of our windows into (or take it out of) the private Space.
+        Everything we show goes in — cat, bubble, bowls, overlays, game
+        panels AND popup menus/tooltips: a window left in a normal Space
+        is drawn *behind* the whole private Space, so an unpinned context
+        menu would open underneath the cat."""
+        if on is None:
+            on = MacOS.pin_wanted()
+        try:
+            win = MacOS._nswindow(widget)
+            if win is None:
+                return False
+            num = int(win.windowNumber())
+            if num <= 0:
+                return False                # not on screen yet; Show retries
+            sky = MacOS._skylight()
+            if on:
+                sid = MacOS._pin_space()
+                sky.CGSAddWindowsToSpaces(MacOS._cid, MacOS._cf_ints(num),
+                                          MacOS._cf_ints(sid))
+                MacOS._pinned.add(num)
+            elif num in MacOS._pinned and MacOS._pin_sid:
+                sky.CGSRemoveWindowsFromSpaces(MacOS._cid,
+                                               MacOS._cf_ints(num),
+                                               MacOS._cf_ints(MacOS._pin_sid))
+                MacOS._pinned.discard(num)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def repin_all():
+        """Monitor plugged in or pulled: move every visible window of ours
+        into or out of the private Space to match pin_wanted()."""
+        on = MacOS.pin_wanted()
+        for w in QApplication.topLevelWidgets():
+            if w.isVisible():
+                MacOS.pin_window(w, on)
+
+
 PLATFORM_NOTE = _linux_platform_shim()
 _linux_preflight_warn()
 
 try:
     from PySide6.QtCore import (Qt, QTimer, QObject, QPoint, QPointF, QRect,
-                            Signal)
+                            QEvent, Signal)
     from PySide6.QtGui import (QAction, QColor, QCursor, QFont,
                                QGuiApplication, QIcon, QPainter,
                                QPainterPath, QPixmap, QFontMetrics, QPolygonF, QPen)
     from PySide6.QtWidgets import (QApplication, QColorDialog, QInputDialog,
-                                   QLineEdit, QMenu, QMessageBox,
-                                   QSystemTrayIcon, QVBoxLayout, QWidget)
+                                   QLineEdit, QMenu, QMessageBox, QProxyStyle,
+                                   QStyle, QSystemTrayIcon, QVBoxLayout,
+                                   QWidget)
 except Exception:
     _fatal("PySide6 (the GUI library) isn't installed correctly.",
-           "Fix: run install.bat again (Windows) or ./install.sh (Linux).\n"
+           "Fix: run install.bat again (Windows) or ./install.sh "
+           "(Linux / macOS).\n"
            "On Linux, also make sure system display libraries exist:\n"
            + LINUX_DEPS_HINT + "\n\n" + traceback.format_exc())
     sys.exit(1)
@@ -178,6 +692,17 @@ PID_PATH = os.path.join(os.path.expanduser("~"), ".sondercat_pid")
 
 TOP_MARGIN = 68
 TICK_MS = 33                    # ~30 fps
+SCROLL_HOLD_S = 1.5             # scroll this long before it counts as "scrolling"
+SCROLL_GAP_S = 0.6              # a pause this long ends the current scroll burst
+SCROLL_END_S = 1.5              # once playing, this long without a scroll ends it
+SCROLL_COOLDOWN_S = (10, 30)    # after a paper session, rest this long (random)
+SOUND_HOLD_S = 4.0              # sound must play this long before headphones go on
+SOUND_GAP_S = 1.5               # silence this long takes them off / ends the burst
+OVERHEAT_ON_KPS = 5.5           # typing faster than this turns the cat red
+OVERHEAT_OFF_KPS = 3.5          # ...and it stays red until you slow to this
+OVERHEAT_MIN_S = 2.0            # once red, stay red at least this long
+SLIDE_JUMP_PX = 120             # perch window leaps this far in one tick = Space switch
+SLIDE_HOLD_S = 0.8              # sit still this long while the desktop slides away
 WIGGLE_SENS = {"high": (3, 12), "medium": (4, 20), "low": (6, 30)}
 
 CAT_DEFAULTS = {"palette": "orange tabby", "pattern": "tabby",
@@ -185,6 +710,7 @@ CAT_DEFAULTS = {"palette": "orange tabby", "pattern": "tabby",
 GLOBAL_DEFAULTS = {"stretch_minutes": 50, "sleep_seconds": 180,
                    "auto_peek": True, "chase_enabled": True,
                    "name": "", "pinned": "", "reminders": [], "laser_only": True, "wiggle_hide": True,
+                   "drop_parachute": False,
                    "wiggle_sens": "medium",
                    "force_sleep": False, "watch_sprites": False,
                    "window_perch": True, "perch_freq": "instant",
@@ -200,7 +726,7 @@ GLOBAL_DEFAULTS = {"stretch_minutes": 50, "sleep_seconds": 180,
                    "feeding": False, "food_level": 1.0, "water_level": 1.0,
                    "feed_last": 0, "bowl_pos": None, "bowl_hide_apps": False,
                    "guard_mode": False, "guard_timer_min": 0,
-                   "hide_mode": False}
+                   "hide_mode": False, "tray_icon": True}
 
 (IDLE, KNEAD, SLEEP, CHASE, DRAG, STRETCH,
  OVERHEAT, SCROLLPLAY, PEEK, THINK, DANCE) = range(11)
@@ -401,9 +927,13 @@ class InputWatcher:
             "f18", "f19", "f20",
         }
         self.last_scroll = 0.0
+        self.scroll_start = 0.0     # when the current scroll burst began
+        self.scroll_active = False  # a burst long enough to count is under way
         self.scroll_accum = 0.0
         self.kb_ok = self.mouse_ok = False
         self._down = set()
+        if IS_MAC:
+            self._mac_prime_pynput()
         try:
             from pynput import keyboard
             self._kb = keyboard.Listener(on_press=self._on_press,
@@ -435,6 +965,66 @@ class InputWatcher:
             self._ms = None
         self.mouse_ok = bool(self._native or self._ms)
 
+    @staticmethod
+    def _mac_prime_pynput():
+        """Two macOS-only hazards in pynput's listener threads, defused once
+        here on the main thread before they start:
+        * pyobjc resolves names lazily and not thread-safely — the keyboard
+          and mouse threads both touch AXIsProcessTrusted as they start and
+          can race into a KeyError, so resolve it first;
+        * the keyboard thread reads the keyboard layout through Carbon TIS
+          calls that current macOS insists happen on the main queue — it
+          traps the WHOLE process otherwise (SIGTRAP in
+          TSMGetInputSourceProperty). Read the layout here and hand the
+          listener a cached copy instead."""
+        try:
+            import HIServices
+            HIServices.AXIsProcessTrusted
+        except Exception:
+            pass
+        try:
+            import contextlib
+            from pynput._util import darwin as _pd
+            from pynput.keyboard import _darwin as _pk
+            with _pd.keycode_context() as ctx:
+                cached = ctx
+
+            @contextlib.contextmanager
+            def _cached_context():
+                yield cached
+
+            _pd.keycode_context = _cached_context
+            _pk.keycode_context = _cached_context
+        except Exception:
+            pass
+        try:
+            # remember each listener's CGEventTap so ensure_alive() can
+            # switch it back on: macOS disables a tap when its callback
+            # stalls (kCGEventTapDisabledByTimeout) or when the privacy
+            # toggles are flipped while we run, and pynput never re-enables
+            # it -- the listener thread stays "alive" but hears nothing
+            from pynput._util import darwin as _pd
+            orig = _pd.ListenerMixin._create_event_tap
+
+            def _create_event_tap(self):
+                tap = orig(self)
+                self._mac_tap = tap
+                return tap
+
+            _pd.ListenerMixin._create_event_tap = _create_event_tap
+        except Exception:
+            pass
+
+    def _mac_reenable_taps(self):
+        try:
+            import Quartz
+            for lst in (self._kb, self._ms):
+                tap = getattr(lst, "_mac_tap", None)
+                if tap is not None and not Quartz.CGEventTapIsEnabled(tap):
+                    Quartz.CGEventTapEnable(tap, True)
+        except Exception:
+            pass
+
     def _on_release(self, key):
         try:
             self._down.discard(key)
@@ -465,10 +1055,13 @@ class InputWatcher:
             has_shift = bool(names & {"shift", "shift_l", "shift_r"})
             has_alt = bool(names & {"alt", "alt_l", "alt_r", "alt_gr"})
             if has_ctrl and has_shift and has_alt:
-                is_p = (vk == 0x50
+                # vk is a Windows virtual-key code on Windows/Linux but a
+                # hardware keycode on macOS (kVK_ANSI_P / kVK_ANSI_R), and
+                # Option changes the char there (π / ‰), so match the code
+                is_p = (vk == (0x23 if IS_MAC else 0x50)
                         or (isinstance(ch, str) and ch.lower() == "p")
                         or ch == "\x10")
-                is_r = (vk == 0x52
+                is_r = (vk == (0x0F if IS_MAC else 0x52)
                         or (isinstance(ch, str) and ch.lower() == "r")
                         or ch == "\x12")
                 if is_p and self.on_update is not None:
@@ -505,8 +1098,19 @@ class InputWatcher:
             except Exception:
                 pass
 
+    def _note_scroll(self):
+        """Stamp a scroll event; a fresh burst starts after a pause. The cat
+        only reacts once a burst has lasted SCROLL_HOLD_S, so a single wheel
+        flick or trackpad twitch doesn't unroll the paper."""
+        now = time.time()
+        if now - self.last_scroll > SCROLL_GAP_S:
+            self.scroll_start = now
+        self.last_scroll = now
+        if now - self.scroll_start >= SCROLL_HOLD_S:
+            self.scroll_active = True       # long enough: it's a session now
+
     def _native_scroll(self, amount):
-        self.last_scroll = time.time()
+        self._note_scroll()
         self.scroll_accum = min(self.scroll_accum + abs(amount) * 6, 60)
         if self.on_event:
             try:
@@ -519,7 +1123,7 @@ class InputWatcher:
         if not amt:
             return
         self.pyn_count += 1
-        self.last_scroll = time.time()
+        self._note_scroll()
         self.scroll_accum = min(self.scroll_accum + amt * 6, 60)
         if self.on_event:
             try:
@@ -555,11 +1159,22 @@ class InputWatcher:
         now = time.time()
         return sum(1 for t in self.key_times if now - t < window) / window
 
-    def scrolling(self, window=1.2):
-        return (time.time() - self.last_scroll) < window
+    def scrolling(self, window=None):
+        """True from the moment a scroll burst has lasted SCROLL_HOLD_S until
+        SCROLL_END_S pass without a scroll. Latching like this means the
+        short pauses inside one reading session (flick, read, flick) don't
+        keep flipping the cat in and out of the paper animation."""
+        if not self.scroll_active:
+            return False
+        if time.time() - self.last_scroll > (window or SCROLL_END_S):
+            self.scroll_active = False
+            return False
+        return True
 
     def ensure_alive(self):
         """pynput listener threads can die silently — resurrect them."""
+        if IS_MAC:
+            self._mac_reenable_taps()
         try:
             if self.kb_ok and (self._kb is None or not self._kb.is_alive()):
                 from pynput import keyboard
@@ -597,8 +1212,33 @@ class FullscreenDetector:
                 return self._check_windows()
             if self.system == "Linux":
                 return self._check_x11()
+            if self.system == "Darwin":
+                return self._check_mac()
         except Exception:
             pass
+        return False
+
+    def _check_mac(self):
+        """A fullscreen app owns a window whose bounds equal a whole screen —
+        true for native fullscreen Spaces and borderless video/games alike.
+        A merely zoomed window stops short of the menu bar, so it won't
+        match. Only the ACTIVE app counts, like the foreground-window check
+        on Windows."""
+        pid, _ = MacOS.frontmost()
+        if not pid or pid == os.getpid():
+            return False
+        screens = []
+        for s in QGuiApplication.screens():
+            g = s.geometry()
+            screens.append((g.left(), g.top(), g.right() + 1, g.bottom() + 1))
+        for w in MacOS.app_windows():
+            if w["pid"] != pid:
+                continue
+            l, t, r, b = w["rect"]
+            for sl, st, sr, sb in screens:
+                if (abs(l - sl) <= 2 and abs(t - st) <= 2
+                        and abs(r - sr) <= 2 and abs(b - sb) <= 2):
+                    return True
         return False
 
     def _check_windows(self):
@@ -1306,6 +1946,45 @@ class _InputBridge(QObject):
     poked = Signal()
 
 
+class _SnappyMenuStyle(QProxyStyle):
+    """macOS: Qt's Mac style gives menus a 1-second 'sloppy submenu' grace
+    period (plus one-directional tracking and no re-selection while it
+    runs), so hovering across the cat's menu — which is mostly submenus —
+    felt like a ~1 s lag on every item. Keep the diagonal-into-submenu
+    forgiveness, just make it short."""
+
+    HINTS = {QStyle.SH_Menu_SubMenuPopupDelay: 120,
+             QStyle.SH_Menu_SubMenuSloppyCloseTimeout: 150,
+             QStyle.SH_Menu_SubMenuUniDirection: 0,
+             QStyle.SH_Menu_SubMenuSloppySelectOtherActions: 1,
+             QStyle.SH_Menu_SubMenuResetWhenReenteringParent: 1}
+
+    def styleHint(self, hint, option=None, widget=None, returnData=None):
+        if hint in self.HINTS:
+            return self.HINTS[hint]
+        return super().styleHint(hint, option, widget, returnData)
+
+
+class _MacWindowTuner(QObject):
+    """macOS: every top-level window we open gets the desktop-pet treatment
+    (MacOS.tune_window), and real dialogs pull the app forward — an
+    accessory app (no Dock icon) doesn't activate on its own, so a message
+    box would otherwise open BEHIND whatever you're working in."""
+
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() in (QEvent.Show, QEvent.WinIdChange) \
+                    and isinstance(obj, QWidget) and obj.isWindow():
+                kind = obj.windowType()
+                if kind == Qt.Tool:
+                    MacOS.tune_window(obj)
+                elif kind in (Qt.Dialog, Qt.Window) \
+                        and ev.type() == QEvent.Show:
+                    MacOS.activate()
+                MacOS.pin_window(obj)       # glued to the glass across Spaces
+        except Exception:
+            pass
+        return False
 
 
 def pick_minutes(title, label, initial_min=25):
@@ -1333,10 +2012,14 @@ def pick_minutes(title, label, initial_min=25):
 
 
 class _AudioMeter:
-    """System output level 0..1 via WASAPI IAudioMeterInformation."""
+    """System output level 0..1 via WASAPI IAudioMeterInformation (Windows).
+    macOS reports 1.0 while any other app is streaming to the output device
+    and 0.0 otherwise — enough for the headphones/dance reactions, which
+    only ask 'is sound playing?'."""
     def __init__(self):
         self._meter = None
         self._dead_until = 0.0
+        self._mac_last = 0.0
 
     def _init_com(self):
         import ctypes
@@ -1387,6 +2070,8 @@ class _AudioMeter:
         self._byref = byref
 
     def peak(self):
+        if IS_MAC:
+            return self._peak_mac()
         if platform.system() != "Windows":
             return 0.0
         now = time.time()
@@ -1407,6 +2092,22 @@ class _AudioMeter:
             self._meter = None          # device changed: re-init later
             self._dead_until = now + 5
             return 0.0
+
+    def _peak_mac(self):
+        now = time.time()
+        if now < self._dead_until:
+            return self._mac_last
+        try:
+            somewhere, here = MacOS.audio_state()
+        except Exception:
+            self._dead_until = now + 30
+            return 0.0
+        if here:
+            # our own meow/purr is driving the device too — CoreAudio can't
+            # separate the two, so hold the last honest reading
+            return self._mac_last
+        self._mac_last = 1.0 if somewhere else 0.0
+        return self._mac_last
 
 
 class GuideGlow(QWidget):
@@ -1812,6 +2513,8 @@ class RockPaperScissorsGame(QWidget):
         self._tick.timeout.connect(self._step)
         self._tick.start(33)
         self.show()
+        if IS_MAC:
+            MacOS.sink_below_cat(self)     # the cat stands IN the panel
         self.raise_()
         self.activateWindow()
         self.setFocus()
@@ -2034,6 +2737,8 @@ class BlackjackGame(QWidget):
         self._tick.timeout.connect(self._step)
         self._tick.start(33)
         self.show()
+        if IS_MAC:
+            MacOS.sink_below_cat(self)     # the cat stands IN the panel
         self.raise_()
         self.activateWindow()
         self.setFocus()
@@ -2788,6 +3493,9 @@ class AskBox(QWidget):
         thread to the current foreground window's thread lets it through,
         so the ask box truly grabs the keyboard and the first keystroke
         lands in it (no click needed)."""
+        if IS_MAC:
+            MacOS.activate()
+            return
         if platform.system() != "Windows":
             return
         try:
@@ -2919,11 +3627,19 @@ class Manager(QObject):
         self._guide_done = []            # labels of completed steps
         self._ai_hist = []
         self._ask_box = None
-        self._music_hist = deque(maxlen=24)
+        self._sound_start = 0.0         # when the current sound burst began
+        self._sound_last = 0.0          # last poll that heard sound
         self.music_on = False
         self._music_timer = QTimer()
         self._music_timer.timeout.connect(self._poll_music)
         self._music_timer.start(120)
+        if IS_MAC:
+            # hide everything while the screen is locked (see set_pin_hidden)
+            self._lock_timer = QTimer()
+            self._lock_timer.timeout.connect(MacOS.poll_lock)
+            self._lock_timer.start(500)
+            self._mac_perm_timer = None     # polls for a permission grant
+            self._mac_perm_missing = (False, False)
         self._guard_beam = None
         self._duck_game = None          # easter-egg minigame window
         self._rps_game = None           # rock-paper-scissors window
@@ -3199,6 +3915,16 @@ class Manager(QObject):
                         else "couldn't reach GitHub — try later 🌐"
                     ui(lambda: self.say_primary(msg, 5))
                 return
+            if IS_MAC and "class MacOS" not in remote_main:
+                # upstream hasn't merged the macOS backend: installing its
+                # files would strip this port (the first-run "start fresh"
+                # pull did exactly that once). Updates resume by themselves
+                # once main carries the backend.
+                if manual:
+                    ui(lambda: self.say_primary(
+                        "upstream has no macOS build yet — update this "
+                        "port with git pull instead 🐾", 6))
+                return
             main_bytes = remote_main.encode("utf-8")
             label = f"v{ver}" if ver and ver != APP_VERSION \
                 else f"v{APP_VERSION} refresh"
@@ -3473,21 +4199,90 @@ class Manager(QObject):
     # -------------------------------------------------------------- tray ----
     def _make_tray(self):
         try:
+            if not self.cfg["global"].get("tray_icon", True):
+                # menu bar / tray icon switched off: the cat's own
+                # right-click menu has everything, so just keep it hidden
+                if self.tray is not None:
+                    self.tray.hide()
+                return
             p = self.primary()
             icon = QIcon(QPixmap.fromImage(sprites.render_icon(
                 p.palette() if p else sprites.PALETTES["orange tabby"],
                 p.ccfg["pattern"] if p else "tabby", 4)))
             if self.tray is None:
                 self.tray = QSystemTrayIcon(icon)
-                self.tray.show()
             else:
                 self.tray.setIcon(icon)
+            self.tray.show()
             self.tray.setToolTip(APP_NAME)
             if self.primary():
                 self._tray_menu = self.primary().build_menu()
                 self.tray.setContextMenu(self._tray_menu)
         except Exception:
             self.tray = None
+
+    def mac_permission_check(self, manual=False):
+        """macOS gates global input hooks behind two privacy switches. Ask
+        the system to prompt for whichever is missing and say what each
+        one unlocks (the cursor itself is read through Qt and needs
+        neither — eyes follow and the laser hunt work regardless)."""
+        if not IS_MAC:
+            return
+        ax = MacOS.ax_trusted(prompt=True)
+        im = MacOS.input_monitoring(prompt=True)
+        sys.stderr.write(f"[SondeR cat] macOS permissions: accessibility="
+                         f"{ax} input_monitoring={im} hooks: keyboard="
+                         f"{self.inputs.kb_ok} mouse={self.inputs.mouse_ok}\n")
+        missing = []
+        if not ax:
+            missing.append("Accessibility (scroll + petting hooks)")
+        if not im:
+            missing.append("Input Monitoring (typing reactions)")
+        if not missing:
+            if manual:
+                self.say_primary("all macOS permissions granted ✅", 3)
+            return
+        self.say_primary(
+            "macOS: please allow " + " and ".join(missing)
+            + " in System Settings → Privacy & Security — I'll restart "
+              "myself once you do 🐾", 12)
+        if manual or (ax and not im):
+            # Accessibility comes with a system dialog; Input Monitoring
+            # doesn't always get one (or a row), so take the user straight
+            # to the pane where they can add the app with "+"
+            MacOS.open_privacy_pane("accessibility" if not ax else "input")
+            if ax and not im:
+                self.say_primary(
+                    "Input Monitoring: if I'm not in that list, click + "
+                    "and pick 'SondeR cat.app' from my folder 🐾", 12)
+        # The input hooks pynput opened before the grant stay dead for the
+        # life of the process, so watch for the switch flipping and restart
+        # — otherwise "I allowed it but it still ignores my typing".
+        if self._mac_perm_timer is None:
+            self._mac_perm_missing = (not ax, not im)
+            self._mac_perm_timer = QTimer(self)
+            self._mac_perm_timer.timeout.connect(self._mac_perm_poll)
+            self._mac_perm_timer.start(3000)
+
+    def _mac_perm_poll(self):
+        need_ax, need_im = self._mac_perm_missing
+        if need_ax and MacOS.ax_trusted():
+            # Accessibility done: hand-hold through Input Monitoring, whose
+            # row/dialog macOS doesn't reliably create on its own
+            self._mac_perm_missing = (False, need_im)
+            if need_im and not MacOS.input_monitoring():
+                MacOS.open_privacy_pane("input")
+                self.say_primary(
+                    "thanks! now Input Monitoring: if I'm not in that "
+                    "list, click + and pick 'SondeR cat.app' 🐾", 12)
+                return
+        if (need_ax and not MacOS.ax_trusted()) \
+                or (need_im and not MacOS.input_monitoring()):
+            return
+        self._mac_perm_timer.stop()
+        self._mac_perm_timer = None
+        self.say_primary("permissions granted! restarting to use them ✨", 3)
+        QTimer.singleShot(1500, self._restart)
 
     # ------------------------------------------------------- global actions -
     def start_pomodoro(self, mins, kind, loop=None):
@@ -3529,7 +4324,7 @@ class Manager(QObject):
             QMessageBox.information(
                 None, "Scroll doctor",
                 f"During the 5-second window I saw:\n\n"
-                f"  Native Windows hook:  {nat}\n"
+                f"  Native OS hook:       {nat}\n"
                 f"  pynput listener:      {pc} events\n\n"
                 + ("Scroll detection is WORKING — if you don't see the "
                    "paper, tell me." if (n > 0 or pc > 0) else
@@ -3543,7 +4338,11 @@ class Manager(QObject):
         """Fake a scroll so the user can see the paper animation exists,
         independent of whether the global scroll hook works."""
         self.inputs.last_scroll = time.time() + 3     # hold it for a bit
+        self.inputs.scroll_start = time.time() - 2    # counts as a real burst
+        self.inputs.scroll_active = True
         self.inputs.scroll_accum = 35
+        for c in self.cats:
+            c._scroll_cool_until = 0.0                # skip the rest period
         if not self.inputs.mouse_ok:
             self.say_primary("(my scroll hook is OFF — see About)", 4)
 
@@ -3551,6 +4350,14 @@ class Manager(QObject):
         g = self.cfg["global"]
         g["wiggle_hide"] = not g.get("wiggle_hide", True)
         save_config(self.cfg)
+
+    def toggle_drop_parachute(self):
+        g = self.cfg["global"]
+        g["drop_parachute"] = not g.get("drop_parachute", False)
+        save_config(self.cfg)
+        self.say_primary("drop me anywhere — I'll float down ☂️"
+                         if g["drop_parachute"]
+                         else "I'll stay where you put me now.", 3)
 
     def toggle_laser(self):
         g = self.cfg["global"]
@@ -3573,17 +4380,21 @@ class Manager(QObject):
                      or self._duck_game is not None)
         if our_sound:
             return          # leave music_on / music_mode exactly as they are
-        self._music_hist.append(self._audio.peak())
-        h = list(self._music_hist)
-        if len(h) < 12:
-            return
-        loud = sum(1 for v in h if v > 0.015)
-        meter_on = getattr(self, "_meter_on", False)
-        if not meter_on and loud >= int(len(h) * 0.7):
-            meter_on = True
-        elif meter_on and loud <= int(len(h) * 0.15):
-            meter_on = False
-        self._meter_on = meter_on
+        # Same burst logic as scrolling: sound has to be CONTINUOUS for
+        # SOUND_HOLD_S before it counts, and a silence longer than
+        # SOUND_GAP_S ends the burst. A notification ding (which keeps the
+        # macOS output device "running" for ~2.5 s afterwards) or a brief
+        # quiet passage in a song therefore neither starts nor stops the
+        # headphones.
+        now = time.time()
+        if self._audio.peak() > 0.015:
+            if now - self._sound_last > SOUND_GAP_S:
+                self._sound_start = now            # new burst
+            self._sound_last = now
+        self._meter_on = ((now - self._sound_last) <= SOUND_GAP_S
+                          and (self._sound_last - self._sound_start)
+                          >= SOUND_HOLD_S)
+        meter_on = self._meter_on
         # sound playing -> headphones on; the full dance-with-notes show
         # only if the user enabled it in Behavior
         if not meter_on:
@@ -3711,6 +4522,16 @@ class Manager(QObject):
             cur, 0, 720, 1)
         if ok:
             self.set_guard_timer(mins)
+
+    def toggle_tray_icon(self):
+        g = self.cfg["global"]
+        g["tray_icon"] = not g.get("tray_icon", True)
+        save_config(self.cfg)
+        self._make_tray()
+        where = "menu bar" if IS_MAC else "tray"
+        self.say_primary(f"{where} icon back on" if g["tray_icon"]
+                         else f"{where} icon hidden -- right-click ME "
+                              f"for the menu 🐾", 3)
 
     def toggle_hide_mode(self):
         g = self.cfg["global"]
@@ -3907,6 +4728,17 @@ class Manager(QObject):
             return True
         if not self.cfg["global"].get("bowl_hide_apps", False):
             return False
+        if IS_MAC:
+            try:
+                pid, bundle = MacOS.frontmost()
+                if not pid or pid == os.getpid():
+                    return False
+                if bundle == "com.apple.finder":
+                    # Finder with no window open is just the desktop
+                    return any(w["pid"] == pid for w in MacOS.app_windows())
+                return True
+            except Exception:
+                return False
         if platform.system() != "Windows":
             return False
         try:
@@ -4060,6 +4892,14 @@ class Manager(QObject):
                 g["vision_consent"] = True
             g["screen_vision"] = True
             save_config(self.cfg)
+            if IS_MAC and not MacOS.screen_capture(prompt=True):
+                # without Screen Recording, grabWindow() returns only the
+                # wallpaper — the feature stays on, it just needs the switch
+                self.say_primary(
+                    "macOS: allow Screen Recording for me in System Settings "
+                    "→ Privacy & Security, then restart me 👀", 10)
+                MacOS.open_privacy_pane("screen")
+                return
             self.say_primary(
                 "I can peek at your screen when you ask about it now 👀", 4)
         else:
@@ -4135,7 +4975,24 @@ class Manager(QObject):
             # capture the screen the ACTIVE window is on (multi-monitor):
             # the thing being asked about is almost always in the foreground
             scr = None
-            if platform.system() == "Windows":
+            if IS_MAC:
+                if not MacOS.screen_capture(prompt=True):
+                    self.say_primary(
+                        "I can't see the screen yet — allow Screen Recording "
+                        "in System Settings → Privacy & Security 👀", 8)
+                    return None, None
+                try:
+                    pid, _ = MacOS.frontmost()
+                    fg = [w for w in MacOS.app_windows() if w["pid"] == pid]
+                    if fg:
+                        area = lambda w: ((w["rect"][2] - w["rect"][0])
+                                          * (w["rect"][3] - w["rect"][1]))
+                        l, t, r, b = max(fg, key=area)["rect"]
+                        scr = QGuiApplication.screenAt(
+                            QPoint((l + r) // 2, (t + b) // 2))
+                except Exception:
+                    scr = None
+            elif platform.system() == "Windows":
                 try:
                     import ctypes
                     from ctypes import wintypes
@@ -5121,8 +5978,11 @@ class CatWindow(QWidget):
         self.jump_until = 0.0
         self.startle_cooldown = 0.0
         self.knead_hyst = False
+        self.overheat_hyst = False       # currently red-hot (hysteresis)
+        self._overheat_since = 0.0
         self.last_overheat_say = 0.0
         self.last_scroll_say = 0.0
+        self._scroll_cool_until = 0.0    # no paper play before this
         self.next_zzz = 0.0
         self.next_think_bubble = 0.0
 
@@ -5150,6 +6010,9 @@ class CatWindow(QWidget):
         self.perch_pending = None
         self.perch_until = 0.0
         self.perch_home = None
+        self._slide_last_l = None        # macOS: perch window's left edge last tick
+        self._slide_hold_until = 0.0     # ...sit still until then (desktop slide)
+        self._slide_seen_ok = False
         self.next_perch_try = time.time() + random.uniform(30, 90)
         self.next_corner_at = time.time() + random.uniform(60, 180)
         self._corner_until = 0.0         # sitting in the corner until this time
@@ -5359,6 +6222,15 @@ class CatWindow(QWidget):
         rem.triggered.connect(lambda: mgr.remove_cat(self))
         cats.addAction(rem)
         thm = cats.addMenu("Themes ✨")
+        dft = QAction("Default 🐱", menu)
+        dft.setCheckable(True)
+        dft.setChecked(self.ccfg["palette"] == CAT_DEFAULTS["palette"]
+                       and self.ccfg["pattern"] == CAT_DEFAULTS["pattern"]
+                       and not self.ccfg["custom_body"]
+                       and not self.ccfg.get("eye_color"))
+        dft.triggered.connect(self.set_default_theme)
+        thm.addAction(dft)
+        thm.addSeparator()
         lil = QAction("Lilly", menu)
         lil.setCheckable(True)
         lil.setChecked(self.ccfg["palette"] == "lilly")
@@ -5447,6 +6319,11 @@ class CatWindow(QWidget):
         wigh.setChecked(self.gcfg.get("wiggle_hide", True))
         wigh.triggered.connect(mgr.toggle_wiggle_hide)
         beh.addAction(wigh)
+        drop = QAction("Parachute down when I'm dropped ☂️", menu)
+        drop.setCheckable(True)
+        drop.setChecked(self.gcfg.get("drop_parachute", False))
+        drop.triggered.connect(mgr.toggle_drop_parachute)
+        beh.addAction(drop)
         dnc = QAction("Headphones when sound plays 🎧", menu)
         dnc.setCheckable(True)
         dnc.setChecked(self.gcfg.get("dance_music", True))
@@ -5680,6 +6557,11 @@ class CatWindow(QWidget):
         rst = QAction("Restart the cat 🔄  (Ctrl+Shift+Alt+R)", menu)
         rst.triggered.connect(mgr._restart)
         upds.addAction(rst)
+        if IS_MAC:
+            perm = QAction("Check macOS permissions… 🔐", menu)
+            perm.triggered.connect(
+                lambda _=False: mgr.mac_permission_check(manual=True))
+            upds.addAction(perm)
         upds.addSeparator()
         chan = " · Store" if IS_STORE_BUILD else ""
         uinf = QAction(
@@ -5687,6 +6569,12 @@ class CatWindow(QWidget):
         uinf.setEnabled(False)
         upds.addAction(uinf)
 
+        tray_act = QAction("Menu bar icon 🐱" if IS_MAC else "Tray icon 🐱",
+                           menu)
+        tray_act.setCheckable(True)
+        tray_act.setChecked(self.gcfg.get("tray_icon", True))
+        tray_act.triggered.connect(mgr.toggle_tray_icon)
+        menu.addAction(tray_act)
         quit_act = QAction("Quit", menu)
         quit_act.triggered.connect(QApplication.instance().quit)
         menu.addAction(quit_act)
@@ -5712,6 +6600,19 @@ class CatWindow(QWidget):
             self.mgr._make_tray()
         self.say({"lilly": "Lilly! 🧡", "jj": "JJ! 💚",
                   "mimi": "Mimi! 💙"}.get(name, f"New fur: {name}!"))
+
+    def set_default_theme(self):
+        """Back to the plain orange tabby: stock fur, pattern and eyes."""
+        self.ccfg["palette"] = CAT_DEFAULTS["palette"]
+        self.ccfg["pattern"] = CAT_DEFAULTS["pattern"]
+        self.ccfg["custom_body"] = None
+        self.ccfg["eye_color"] = None
+        save_config(self.mgr.cfg)
+        self._frame_cache = {}
+        if self.index == 0:
+            self.mgr._make_tray()
+        self.say("back to my usual self 🐱")
+        self.update()
 
     def set_pattern(self, name):
         self.ccfg["pattern"] = name
@@ -6033,7 +6934,21 @@ class CatWindow(QWidget):
         typing_now = (inputs.key_held()
                       or inputs.typing(1.0 if self.knead_hyst else 0.25))
         self.knead_hyst = typing_now
-        overheat = (inputs.keys_per_sec() > 5.5 and typing_now)
+        # overheat with hysteresis: a burst over OVERHEAT_ON_KPS turns the
+        # cat red, and it only cools once the rate falls under the lower
+        # OVERHEAT_OFF_KPS (and it has been red for OVERHEAT_MIN_S) --
+        # a single threshold made it flicker red/normal on every keystroke
+        # while the rate hovered around the line
+        kps = inputs.keys_per_sec()
+        if self.overheat_hyst:
+            overheat = typing_now and (kps > OVERHEAT_OFF_KPS
+                                       or now - self._overheat_since
+                                       < OVERHEAT_MIN_S)
+        else:
+            overheat = typing_now and kps > OVERHEAT_ON_KPS
+            if overheat:
+                self._overheat_since = now
+        self.overheat_hyst = overheat
 
         # --- startle ---
         d_cur = self._dist_to_cursor(cur)
@@ -6054,6 +6969,15 @@ class CatWindow(QWidget):
         start_chase = (self.gcfg["chase_enabled"] and chase_trigger
                        and now > self.chase_cooldown
                        and self.state in (IDLE, PEEK, THINK))
+
+        # paper play: one session per scroll marathon, then a breather --
+        # otherwise every page you skim while reading has the cat dropping
+        # what it was doing to shred paper, which gets old fast
+        if self.state == SCROLLPLAY and not inputs.scrolling():
+            self._scroll_cool_until = now + random.uniform(*SCROLL_COOLDOWN_S)
+        scroll_play = (inputs.scrolling()
+                       and (self.state == SCROLLPLAY
+                            or now > self._scroll_cool_until))
 
         # --- state selection (priority order) ---
         if getattr(self, "duck_gunner", False):
@@ -6119,7 +7043,7 @@ class CatWindow(QWidget):
                     "x": r.left() + random.randint(20, r.width() - 20),
                     "y": r.top() + 6, "vy": 1.3, "life": 1.2,
                     "seed": random.random() * 6})
-        elif (inputs.scrolling() and not want_peek
+        elif (scroll_play and not want_peek
               and inputs.last_scroll >= inputs.last_key
               and not self.mgr.cfg["global"].get("guard_mode", False)):
             if self.state != SCROLLPLAY and now - self.last_scroll_say > 10:
@@ -6129,7 +7053,7 @@ class CatWindow(QWidget):
         elif typing_now and not want_peek \
                 and not self.mgr.cfg["global"].get("guard_mode", False):
             self.state = KNEAD
-        elif inputs.scrolling() and not want_peek \
+        elif scroll_play and not want_peek \
                 and not self.mgr.cfg["global"].get("guard_mode", False):
             if self.state != SCROLLPLAY and now - self.last_scroll_say > 10:
                 self.last_scroll_say = now
@@ -6473,6 +7397,11 @@ class CatWindow(QWidget):
                         ["back to my post. 😾", "I have a JOB to do.",
                          "nice try. resuming patrol."]), 2.2)
                     self._glide_to(post, speed=600)
+            elif self.gcfg.get("drop_parachute", False):
+                # opt-in: let go of it anywhere above the floor and it pops
+                # the parachute and drifts back down (to the Dock's edge on
+                # a Mac) instead of hanging where you dropped it
+                self._parachute_to_ground()
             self.mgr.save_all()
 
     def mouseMoveEvent(self, ev):
@@ -6664,6 +7593,8 @@ class CatWindow(QWidget):
 
     def _perch_targets(self):
         """Visible, non-minimized, decent-sized top-level windows."""
+        if IS_MAC:
+            return self._mac_perch_targets()
         if platform.system() != "Windows":
             return []
         try:
@@ -6712,6 +7643,8 @@ class CatWindow(QWidget):
 
     def _perch_query(self, hwnd):
         """('ok', rect) while perchable; 'minimized'; 'gone'."""
+        if IS_MAC:
+            return self._mac_perch_query(hwnd)
         if platform.system() != "Windows":
             return "gone"
         try:
@@ -6755,15 +7688,12 @@ class CatWindow(QWidget):
         self._glide_to(QPoint(gx, gy), speed=600)
 
     def _corner_point(self):
-        """The bottom corner the cat is currently CLOSEST to (left or right),
-        so it doesn't cross the whole screen or keep switching sides."""
+        """The cat's corner is always the bottom-RIGHT one (the bottom-left
+        belongs to the duck-hunt gunner), so it never ends up standing on
+        the Dock side or switching sides between trips."""
         scr = self.screen().availableGeometry()
         gy = scr.bottom() - self._feet_offset()
-        left_x = scr.left() + 6
-        right_x = scr.right() - self.width() - 6
-        cat_cx = self.x() + self.width() // 2
-        screen_mid = (scr.left() + scr.right()) // 2
-        gx = left_x if cat_cx <= screen_mid else right_x
+        gx = scr.right() - self.width() - 6
         return QPoint(gx, gy)
 
     def _go_to_corner(self, now):
@@ -6812,17 +7742,73 @@ class CatWindow(QWidget):
 
     def _perch_covered(self, l, t, r, b):
         """Probe beside the cat: is our window's top edge still showing?"""
-        if platform.system() != "Windows" or self.perch_hwnd is None:
+        if self.perch_hwnd is None:
             return False
-        dpr = self._dpr()
+        if not IS_MAC and platform.system() != "Windows":
+            return False
+        dpr = 1.0 if IS_MAC else self._dpr()    # CG bounds are already points
         # a point next to the cat (never under it), just inside the top edge
         px = self.x() - 50
         if px < l + 10:
             px = self.x() + self.width() + 50
         px = max(l + 10, min(px, r - 10))
-        res = self._showing_at(self.perch_hwnd, px * dpr,
-                               (t + 8) * dpr)
+        probe = self._mac_showing_at if IS_MAC else self._showing_at
+        res = probe(self.perch_hwnd, px * dpr, (t + 8) * dpr)
         return res is False          # None (our own cat) never counts
+
+    # ---- macOS perching: the CoreGraphics window list plays user32 -------
+    def _mac_showing_at(self, wid, x, y):
+        """Is window `wid` the one actually visible at point (x, y)?
+        True/False, or None when our own cat covers the point."""
+        try:
+            w = MacOS.window_at(x, y)
+            if w is None:
+                return False
+            if w["pid"] == os.getpid():
+                return None
+            return w["id"] == wid
+        except Exception:
+            return True              # never evict on probe errors
+
+    def _mac_perch_targets(self):
+        try:
+            out = []
+            for w in MacOS.app_windows():
+                l, t, r, b = w["rect"]
+                if r - l < 380 or b - t < 260:
+                    continue
+                if t - self._feet_offset() < 8:
+                    continue                 # no headroom for the cat
+                xs = [int(l + (r - l) * f) for f in (0.2, 0.5, 0.8)
+                      if self._mac_showing_at(w["id"], l + (r - l) * f,
+                                              t + 8)]
+                if not xs:
+                    continue                 # buried under other windows
+                out.append((w["id"], (l, t, r, b), xs))
+            return out
+        except Exception:
+            return []
+
+    def _mac_perch_query(self, wid):
+        try:
+            on = [w for w in MacOS.windows(True) if w["id"] == wid]
+            if not on:
+                # still exists but off-screen: minimized, hidden app, or
+                # left behind on another Space — the cat slides down either
+                # way; truly closed → gone (parachute)
+                exists = any(w["id"] == wid for w in MacOS.windows(False))
+                return "minimized" if exists else "gone"
+            l, t, r, b = on[0]["rect"]
+            scr = (QGuiApplication.screenAt(QPoint((l + r) // 2,
+                                                   (t + b) // 2))
+                   or self.screen())
+            a = scr.availableGeometry()
+            if (l <= a.left() + 2 and t <= a.top() + 2
+                    and r >= a.right() - 1 and b >= a.bottom() - 1):
+                return "maximized"           # zoomed to fill the screen
+            return ("ok", (l, t, r, b))
+        except Exception:
+            return "gone"
 
     def try_perch(self, announce=False):
         targets = self._perch_targets()
@@ -6962,6 +7948,9 @@ class CatWindow(QWidget):
         if self.perch_pending is not None and self.glide_target is None:
             self.perch_hwnd = self.perch_pending
             self.perch_pending = None
+            self._slide_last_l = None
+            self._slide_hold_until = 0.0
+            self._slide_seen_ok = False
             self.perch_until = now + random.uniform(90, 240)
             self._shake_strikes = 0
             self._cover_miss = 0
@@ -6994,6 +7983,31 @@ class CatWindow(QWidget):
         if q == "gone" or q == "maximized":
             self._fall_off(now)              # dropped! (closed / maximized)
             return
+        # 🖥️ macOS desktop switch: the window under the cat races off the
+        # screen edge (~1s slide) and then leaves the on-screen list. The cat
+        # is glued to the glass, so following it would drag the cat along the
+        # slide and then dump it — instead, the moment the window leaps
+        # further than a hand could drag it in one tick, sit still and wait
+        # for the transition to finish before deciding what to do.
+        if IS_MAC:
+            hold = self._slide_hold_until
+            if isinstance(q, tuple):
+                l_now = q[1][0]
+                l_prev = self._slide_last_l
+                if l_prev is not None and abs(l_now - l_prev) > SLIDE_JUMP_PX:
+                    hold = self._slide_hold_until = now + SLIDE_HOLD_S
+                self._slide_last_l = l_now
+                self._slide_seen_ok = True
+            elif now >= hold and self._slide_seen_ok:
+                # it was right there a tick ago and now it's off the list:
+                # the slide is faster than our window-list cache, so this is
+                # usually how a desktop switch looks from up here. Sit tight
+                # and decide once the transition is over.
+                self._slide_seen_ok = False
+                hold = self._slide_hold_until = now + SLIDE_HOLD_S
+            if now < hold:
+                self._perch_hist.clear()        # a slide is not "shaking"
+                return
         if q == "minimized":
             self._end_perch(go_home=False)
             # walk down to the bottom of the screen and settle for a nap
@@ -7027,6 +8041,12 @@ class CatWindow(QWidget):
         x = max(l + 6, min(l + self.perch_offx, r - self.width() - 6))
         y = t - self._feet_offset()
         if (x, y) != (self.x(), self.y()):
+            dx, dy = x - self.x(), y - self.y()
+            if abs(dx) + abs(dy) > 60:
+                # far off (window flung, or we sat out a desktop slide and
+                # it came back): ease over instead of teleporting
+                x = self.x() + int(dx * 0.35)
+                y = self.y() + int(dy * 0.35)
             self.move(x, y)
             self._sync_float()
         # shaking the window under the cat: it objects
@@ -7934,10 +8954,19 @@ def main():
     claim_single_instance()      # any older cat stands down (and shuts up)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    if IS_MAC:
+        MacOS.become_accessory()
+        app.installEventFilter(_MacWindowTuner(app))
+        app.screenAdded.connect(lambda _s: MacOS.repin_all())
+        app.screenRemoved.connect(lambda _s: MacOS.repin_all())
+        app.setStyle(_SnappyMenuStyle(app.style().objectName()))
     ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sondercat_gray.ico")
     if os.path.exists(ico):
         app.setWindowIcon(QIcon(ico))
     mgr = Manager(app)
+    if IS_MAC:
+        # let the first bubble land first, then trigger the system prompts
+        QTimer.singleShot(2500, mgr.mac_permission_check)
     if PLATFORM_NOTE == "wayland":
         mgr.say_primary("Pure Wayland session: some tricks are limited — "
                         "an X11/Xorg login gives me superpowers!", 8)

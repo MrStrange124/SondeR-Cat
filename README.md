@@ -1,11 +1,11 @@
 # SondeR cat 🐾
 
 A pixel cat that lives on your desktop — naps on your windows, vibes to your music, and can even answer questions with a Gemini brain.
-For **Windows** and **Linux**. Free, open source, no telemetry, no accounts.
+For **Windows**, **Linux** and **macOS**. Free, open source, no telemetry, no accounts.
 
 ![SondeR cat — reactions, poses, and cat themes](assets/showcase.png)
 
-> Inspired by [Comnyang](https://comnyang.com/en) on macOS — SondeR cat is its own separate, from-scratch project with entirely original code and art, built to bring that same cozy desktop-pet feeling to Windows and Linux. If you're on a Mac, go check out Comnyang too! 🐾
+> Inspired by [Comnyang](https://comnyang.com/en) on macOS — SondeR cat is its own separate, from-scratch project with entirely original code and art, built to bring that same cozy desktop-pet feeling to Windows and Linux — and now macOS too. Go check out Comnyang as well! 🐾
 
 ## Features
 
@@ -24,7 +24,7 @@ For **Windows** and **Linux**. Free, open source, no telemetry, no accounts.
 - 🧼 **Grooming** — every so often while idle it stops to wash itself, licking a paw and cleaning up before carrying on
 - 🍽️ **Feeding bowls** *(opt-in)* — set out a food bowl and a water bowl on your desktop (*Behavior → Feeding bowls*). They slowly drain over the day; click a bowl to refill it, and when one runs dry the cat wanders over and begs for it. Drag the bowls wherever you like, fill both at once from their right-click menu, and optionally have them tuck away whenever an app is focused
 - 🪟 **Climbs on your windows** — occasionally walks over and sits on top of an open window, riding along if you move it. It even naps up there, grumbles if you shake the window, and slides down if you minimize it (toggleable)
-- ☂️ **Parachute drops** — close (or maximize) the window it's sitting on and the cat doesn't plummet: it pops open a big pixel parachute and drifts gently down to the floor, swinging under the canopy, with a soft "smooth landing"
+- ☂️ **Parachute drops** — close (or maximize) the window it's sitting on and the cat doesn't plummet: it pops open a big pixel parachute and drifts gently down to the floor, swinging under the canopy, with a soft "smooth landing". Optional: *Behavior → Parachute down when I'm dropped* makes it float back to the floor whenever you let go of it mid-air, too
 - 🧍 **Stands in a corner** — an optional idle quirk: now and then it ambles off to a corner of the screen and just stands there a while before wandering back (off by default; pick how often, or Never)
 - 💤 **Deep sleep** toggle — sleeps until YOU say otherwise; nothing wakes it
 - 🫣 **Hide at the bottom** — tuck the cat away at the screen edge, or wiggle your cursor up-down at the bottom to send it there. It stays hidden — ignoring typing, scrolling and mouse wiggles — until you **click** it, then it stands up right where it is
@@ -62,7 +62,7 @@ For **Windows** and **Linux**. Free, open source, no telemetry, no accounts.
 
 ## Install
 
-> **Requires 64-bit Windows 10/11** (or Linux). 32-bit systems can't run the Qt6 framework the cat is built on.
+> **Requires 64-bit Windows 10/11**, Linux, or **macOS 11+** (Apple silicon or Intel). 32-bit systems can't run the Qt6 framework the cat is built on.
 
 ### Windows — one tiny installer
 
@@ -103,6 +103,49 @@ apk), checks system libraries, and offers to fix anything missing.
 
 Requires Python 3.9+ · Dependencies: PySide6 (Essentials), pynput
 
+### macOS
+
+```bash
+git clone https://github.com/Verisonder/SondeR-Cat.git
+cd SondeR-Cat && ./install.sh
+```
+
+The same script detects macOS: it creates a `.venv`, installs the
+dependencies, wraps them in a **`SondeR cat.app`** (double-click it to
+relaunch; optional start-at-login), and opens the cat. Needs Python 3.9+
+(`brew install python` or python.org) — the rest is automatic.
+
+The app's executable is a tiny native launcher (`mac_launcher.c`) that
+embeds the interpreter, so the running process is called **SondeR cat** in
+`top`, Activity Monitor and the Privacy & Security lists — not "Python".
+It's compiled with `clang` from the Xcode Command Line Tools (`xcode-select
+--install`); without them the installer falls back to a shell wrapper that
+works the same but shows up as "Python". Rebuild just the app any time with
+`SONDER_APP_ONLY=1 ./install.sh` — it keeps the compiled launcher unless
+`mac_launcher.c` changed, because macOS ties the granted permissions to the
+app's code hash and would otherwise ask for them again.
+
+macOS then asks for two privacy permissions; **allow both and restart the
+cat** (right-click → Updates → Restart, or Ctrl+Shift+Alt+R):
+
+- **Accessibility** → global mouse hooks: scroll-paper play, and the
+  wiggle/laser hooks
+- **Input Monitoring** → typing reactions: kneading, overheat, Ctrl+Space
+
+Everything else (eyes following the cursor, petting, dragging, naps,
+perching on windows, music headphones…) works without any permission. If you
+turn on the Gemini *"Let me check your screen"* / guide features, it also asks
+for **Screen Recording**, since that's what a screenshot needs on a Mac.
+Check or re-trigger the prompts any time from *Updates → Check macOS
+permissions…*.
+
+Updates: the cat's built-in updater pulls from the upstream `main` branch.
+On a Mac it only installs a version that carries the macOS backend, so it
+can't overwrite this port with a Windows/Linux-only build; until then,
+update with `git pull`.
+
+Requires Python 3.9+ · Dependencies: PySide6, pynput, pyobjc (Cocoa + Quartz)
+
 ### Trust & signing
 
 The tiny online installer (`SondeR_cat_setup.exe`) is frozen — it's never
@@ -133,6 +176,47 @@ command for your distro. If the window ever fails to open:
 # openSUSE             sudo zypper install libxcb-cursor0 libxkbcommon-x11-0
 # Alpine               sudo apk add xcb-util-cursor mesa-gl libxkbcommon
 ```
+
+## macOS support
+
+| Feature | Status |
+|---|---|
+| Cat, bubbles, menus, minigames, bowls, guard mode | ✅ Everything renders and stays put when you click other apps |
+| Switching desktops (Spaces) | ✅ The cat is glued to the glass: it doesn't slide away with the old desktop and pop back on the new one. It lives in a private Space of its own, so it also floats above Mission Control. If it was sitting on a window when you switched, it waits out the slide and then hops down to the floor of the new desktop. It only ever picks windows on the desktop you're actually looking at, so it won't chase a window that belongs to another desktop mid-slide. With a second monitor attached it falls back to ordinary all-Spaces behaviour |
+| Lock screen | ✅ The cat and everything it owns duck out of sight while the screen is locked and come back the moment you unlock (the private Space would otherwise float above the password box) |
+| Eyes follow / laser hunt / petting / mochi drag | ✅ Read through Qt — no permission needed |
+| Typing reactions, Ctrl+Space ask box, Ctrl+Shift+Alt+R | ✅ With **Input Monitoring** allowed |
+| Scroll-paper play | ✅ With **Accessibility** allowed |
+| Sitting on top of your windows, riding along, parachute drop | ✅ Via the CoreGraphics window list — closes → parachute, minimizes → slides down, zoom-to-fill → parachute |
+| Hide during fullscreen video | ✅ Detects native fullscreen Spaces and borderless fullscreen |
+| Headphones / dance when music plays | ✅ Watches whether any app is streaming to the output device (macOS has no public output-level meter, so it's "sound on/off", not a beat) |
+| Gemini screen-look / guide mode | ✅ With **Screen Recording** allowed |
+| Sound (meow, purr, game music) | ✅ QtMultimedia |
+| Self-update | ✅ Same as Linux |
+| Dock icon | None on purpose — it's a pet, not an app. Right-click the cat (or the menu-bar icon) for the menu |
+
+Notes: **Ctrl+Space** is also macOS's default "select previous input source"
+shortcut when you have several keyboards enabled — turn that off in
+*System Settings → Keyboard → Keyboard Shortcuts → Input Sources* if they
+collide. Permissions are attached to whatever launched the cat, so run it
+through `SondeR cat.app` (what `install.sh` builds) rather than from a
+terminal, or the terminal app will be the one you end up authorizing. If you
+upgraded from an older build whose process was called "Python", macOS treats
+the renamed app as new: allow the two permissions once more when it asks
+(the old "Python" entries can be removed).
+
+If the toggles in Privacy & Security show **on** but the cat still ignores
+typing and scrolling, the rows belong to a previous build (macOS keys them
+to the app's code hash). Clear them and let the cat ask again:
+
+```bash
+tccutil reset Accessibility com.verisonder.sondercat
+tccutil reset ListenEvent com.verisonder.sondercat
+```
+
+The cat prints its view of the permissions to stderr at startup
+(`[SondeR cat] macOS permissions: ...`), which you can see by running
+`open --stderr /tmp/cat.log "SondeR cat.app"`.
 
 ## Troubleshooting
 
